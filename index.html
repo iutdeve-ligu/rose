@@ -1,0 +1,254 @@
+<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rose ASCII</title></head><body>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap">
+<style>
+/* Scène nocturne unique : un canvas plein cadre, la rose est une grille de caractères centrée, ancrée en bas. */
+:root {
+  --bg: #05060a;
+  --ink: #8a8fa3;
+  --ink-dim: #5a5f72;
+  --pink: #ff6b9a;
+  --line: #23263a;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+  color-scheme: dark;
+}
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--mono);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+.stage { position: relative; height: 100%; }
+canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.hud { position: absolute; font-size: 12px; line-height: 1.7; letter-spacing: .02em; font-variant-numeric: tabular-nums; }
+.clock { top: 18px; right: 0; color: var(--pink); }
+.clock::before { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--pink); margin-right: 8px; vertical-align: 1px; }
+.info { left: 0; bottom: 18px; color: var(--ink-dim); }
+.info b { font-weight: 400; color: var(--ink); }
+.ctl { right: 0; bottom: 18px; display: flex; gap: 8px; }
+button {
+  font: inherit; color: var(--ink); background: transparent;
+  border: 1px solid var(--line); padding: 6px 12px; cursor: pointer; border-radius: 3px;
+}
+button:hover { border-color: var(--ink-dim); color: #fff; }
+button:focus-visible { outline: 2px solid var(--pink); outline-offset: 2px; }
+@media (max-width: 520px) {
+  .info { bottom: 64px; }
+  .ctl { left: 0; right: auto; }
+}
+</style>
+
+<div class="stage" id="stage">
+  <canvas id="cv" aria-label="Une rose dessinée en caractères ASCII qui éclot, sous un ciel étoilé" role="img"></canvas>
+  <div class="hud clock" id="clock">t 0.00s</div>
+  <div class="hud info" id="info"></div>
+  <div class="hud ctl">
+    <button id="replay" type="button">Rejouer</button>
+    <button id="pause" type="button">Pause</button>
+  </div>
+</div>
+
+<script>
+const COLS = 76, ROWS = 58, CX = 38, HB_FINAL = 27, LOOP = 26;
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const clockEl = document.getElementById("clock"), infoEl = document.getElementById("info");
+const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+let T = 0, paused = reduce, last = 0;
+if (reduce) T = 16;
+
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, k) => a + (b - a) * k;
+const smooth = x => { x = clamp(x); return x * x * (3 - 2 * x); };
+const hash = (a, b) => (Math.imul(a + 17, 73856093) ^ Math.imul(b + 31, 19349663)) >>> 0;
+const rnd = (a, b) => (hash(a, b) % 1000) / 1000;
+
+/* ---------- buffer de caractères ---------- */
+let CH = new Array(COLS * ROWS), CO = new Array(COLS * ROWS), GL = new Uint8Array(COLS * ROWS);
+function put(c, r, ch, color, glow) {
+  if (c < 0 || c >= COLS || r < 0 || r >= ROWS) return;
+  const i = r * COLS + c; CH[i] = ch; CO[i] = color; GL[i] = glow ? 1 : 0;
+}
+function tangentChar(s, w, A, B, u, v) {
+  const ns = s / A, nw = w / B;
+  const nx = u[0] * ns + v[0] * nw, ny = u[1] * ns + v[1] * nw;
+  const tx = -ny, ty = nx, ax = Math.abs(tx), ay = Math.abs(ty);
+  if (ay < 0.4 * ax) return "-";
+  if (ax < 0.4 * ay) return "|";
+  return tx * ty < 0 ? "/" : "\\";
+}
+/* ellipse en coordonnées isotropes (1 ligne = 2 colonnes) ; th = angle de l'axe long au-dessus de l'horizontale */
+function ellipse(cx, cr, A, B, th, paint) {
+  const u = [Math.cos(th), -Math.sin(th)], v = [Math.sin(th), Math.cos(th)];
+  const m = Math.max(A, B) + 1;
+  for (let r = Math.floor(cr - m / 2); r <= Math.ceil(cr + m / 2); r++) {
+    for (let c = Math.floor(cx - m); c <= Math.ceil(cx + m); c++) {
+      const dx = c - cx, dy = (r - cr) * 2;
+      const s = (dx * u[0] + dy * u[1]) / A, w = (dx * v[0] + dy * v[1]) / B, d = s * s + w * w;
+      if (d > 1) continue;
+      const res = paint(s, w, d, c, r, A, B, u, v);
+      if (res) put(c, r, res[0], res[1], res[2]);
+    }
+  }
+}
+
+const DARK = "cr(){}/\\<>", MID = "tfjzv+xk", HI = "0Q8B&@%$", LEAF = "ao(){}<>[]ee";
+const pick = (set, c, r, shim) => set[hash(c * 7 + shim, r) % set.length];
+
+function drawFrame(t) {
+  CH.fill(undefined); GL.fill(0);
+  const g = 1 - Math.pow(1 - clamp(t / 4.5), 3);
+  const b = smooth((t - 3) / 10);
+  const hb = Math.round(ROWS - (ROWS - HB_FINAL) * g);
+  const curve = r => 2.4 * Math.sin(r * 0.08 - 1.0);
+  const hcx = CX + Math.round(curve(hb));
+  const shimT = Math.floor(t * 2);
+
+  /* tige */
+  for (let r = Math.max(hb, 0); r < ROWS; r++) {
+    const c = CX + Math.round(curve(r));
+    const k = rnd(r, 3), col = `hsl(${138 + k * 12} 78% ${30 + k * 14}%)`;
+    put(c - 1, r, "|", col); put(c + 1, r, "|", col);
+    put(c, r, "B8%0@&n$"[hash(r, 5) % 8], `hsl(${135 + k * 15} 85% ${36 + rnd(r, 9) * 22}%)`);
+    if (r > hb + 6 && r % 7 === 3) { r % 14 === 3 ? put(c + 2, r, ">", col) : put(c - 2, r, "<", col); }
+  }
+
+  /* feuilles */
+  const leaf = (attachRow, th0, L, lg) => {
+    if (lg <= 0.02 || attachRow < hb + 2 || attachRow >= ROWS) return;
+    const ax = CX + Math.round(curve(attachRow));
+    const th = th0 + 0.05 * Math.sin(t * 1.3 + attachRow);
+    const A = L * lg, B = Math.max(1.6, 4.2 * lg);
+    const cx = ax + Math.cos(th) * A, cr = attachRow - Math.sin(th) * A / 2;
+    ellipse(cx, cr, A, B, th, (s, w, d, c, r, A_, B_, u, v) => {
+      const val = clamp(0.55 + 0.25 * s + 0.15 * (0.5 - Math.abs(w)));
+      if (d > 0.6) return [tangentChar(s, w, A_, B_, u, v), `hsl(140 80% ${34 + 20 * val}%)`];
+      if (Math.abs(w) < 0.1) return [tangentChar(0, 1, 1, 1, u, v) === "|" ? "-" : tangentChar(0, 1, 1, 1, u, v), `hsl(135 75% ${52}%)`];
+      const vein = ((s + 1) * 4 + Math.abs(w) * 3) % 1 < 0.14;
+      return [vein ? (w * u[0] > 0 ? "/" : "\\") : pick(LEAF, c, r, 0), `hsl(145 82% ${18 + 30 * val}%)`];
+    });
+  };
+  leaf(hb + 12, 0.62, 11, smooth((t - 3) / 4));
+  leaf(hb + 24, Math.PI - 0.5, 10, smooth((t - 4.5) / 4.5));
+
+  /* sépales */
+  const sz = (0.45 + 0.55 * g) * (0.62 + 0.38 * b);
+  for (const sg of [1, -1]) {
+    const A = (4 + 4 * b) * 1.4, B = 2.1;
+    const th = sg > 0 ? 0.25 - b * 0.4 : Math.PI - 0.25 + b * 0.4;
+    ellipse(hcx + sg * 2.5, hb + 0.5, A, B, th, (s, w, d, c, r, A_, B_, u, v) =>
+      [d > 0.5 ? tangentChar(s, w, A_, B_, u, v) : "v_+rtf"[hash(c, r) % 6], `hsl(140 80% ${28 + 20 * (1 - d)}%)`]);
+  }
+
+  /* pétales : couches de l'extérieur vers l'intérieur, arrière avant avant */
+  const LAY = [
+    [5, 1.5, 17, 6, 3.5, 5, 9, 7, 6.5, 1.2, 0],
+    [5, 1, 11, 7.5, 6.5, 4.5, 7.5, 7.5, 7, 0.95, 0.63],
+    [4, 0.8, 6, 8.5, 8.5, 3.5, 5.5, 7, 6.5, 0.55, 0.2],
+    [1, 0, 0, 9, 9.5, 2.8, 4.2, 6.5, 5.5, 0, 0],
+  ];
+  LAY.forEach((Ly, L) => {
+    const [n, R0, R1, up0, up1, a0, a1, bh0, bh1, lean, ph0] = Ly;
+    const R = lerp(R0, R1, b) * sz, up = lerp(up0, up1, b) * sz, a = lerp(a0, a1, b), bh = lerp(bh0, bh1, b);
+    const rot = b * 0.55, list = [];
+    for (let i = 0; i < n; i++) { const ph = (Math.PI * 2 * i) / n + ph0 + rot; list.push([Math.sin(ph), Math.cos(ph)]); }
+    list.sort((p, q) => p[1] - q[1]);
+    for (const [sn, cs] of list) {
+      const wS = 0.65 + 0.35 * Math.abs(cs);
+      const th = Math.PI / 2 - lean * b * sn;
+      const cx = hcx + sn * R, cr = hb - up + cs * R * 0.4;
+      const hue = 348 + (L * 3);
+      ellipse(cx, cr, bh * 2 * sz, a * wS * sz, th, (s, w, d, c, r, A_, B_, u, v) => {
+        const sw = 0.13 * Math.sin(5 * Math.atan2(w, s) + 7 * Math.sqrt(d));
+        const val = clamp(0.5 + 0.28 * s + 0.18 * cs - 0.07 * L + sw);
+        const h = hue + (rnd(c, r) - 0.5) * 10;
+        if (d > 0.62) return [tangentChar(s, w, A_, B_, u, v), `hsl(${h} 82% ${44 + 24 * val}%)`, 1];
+        const shim = rnd(c, r) < 0.12 ? shimT : 0;
+        const set = val < 0.4 ? DARK : val < 0.62 ? MID : HI;
+        return [pick(set, c, r, shim), `hsl(${h} 78% ${20 + 34 * val}%)`, 1];
+      });
+    }
+  });
+  /* message : s'écrit lettre par lettre une fois la rose éclose */
+  const msg = "je t'aime victoire", shown = Math.floor(clamp((t - 12.5) / 3) * msg.length);
+  for (let i = 0; i < shown; i++) if (msg[i] !== " ") put(CX - msg.length + 1 + i * 2, 4, msg[i], `hsl(340 95% ${72 + 10 * Math.sin(t * 3 + i)}%)`, 1);
+  return { b, hb };
+}
+
+/* ---------- étoiles ---------- */
+const COLORS = ["#ffffff", "#cfe3ff", "#ffd0dd", "#8fb0ff"];
+const stars = Array.from({ length: 150 }, (_, i) => ({
+  x: rnd(i, 101), y: rnd(i, 202), ch: ["*", "+", ".", "*", "·"][i % 5], col: COLORS[i % 4],
+  sp: 0.6 + rnd(i, 303) * 2.2, ph: rnd(i, 404) * 6.28, big: i % 11 === 0,
+}));
+
+/* ---------- affichage ---------- */
+let W = 0, H = 0, cellW = 6, offX = 0, offY = 0;
+function resize() {
+  const st = document.getElementById("stage"), dpr = Math.min(devicePixelRatio || 1, 2);
+  W = st.clientWidth; H = st.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  cellW = Math.min(W / COLS, H / (2 * ROWS));
+  offX = (W - COLS * cellW) / 2; offY = H - ROWS * 2 * cellW;
+}
+addEventListener("resize", resize);
+
+function render() {
+  const { b, hb } = drawFrame(T);
+  ctx.clearRect(0, 0, W, H);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  /* étoiles */
+  ctx.shadowBlur = 0;
+  const sf = Math.max(9, cellW * 1.4);
+  ctx.font = `${sf}px "JetBrains Mono", monospace`;
+  for (const s of stars) {
+    const a = 0.3 + 0.7 * (0.5 + 0.5 * Math.sin(T * s.sp + s.ph));
+    ctx.globalAlpha = a; ctx.fillStyle = s.col;
+    const x = s.x * W, y = s.y * H;
+    ctx.fillText(s.ch, x, y);
+    if (s.big) { ctx.globalAlpha = a * 0.45; ctx.fillText("|", x, y - sf); ctx.fillText("|", x, y + sf); ctx.fillText("-", x - sf * 0.7, y); ctx.fillText("-", x + sf * 0.7, y); }
+  }
+  ctx.globalAlpha = 1;
+  /* rose */
+  const fs = cellW * 1.67, ch = cellW * 2, sway = Math.sin(T * 0.9) * clamp((T - 2) / 4) * 2.6;
+  ctx.font = `${fs}px "JetBrains Mono", monospace`;
+  let letters = 0;
+  for (const pass of [0, 1]) {
+    if (pass) { ctx.shadowColor = "rgba(255,50,90,.6)"; ctx.shadowBlur = cellW * 1.6; } else ctx.shadowBlur = 0;
+    for (let r = 0; r < ROWS; r++) {
+      const k = (ROWS - 1 - r) / (ROWS - 1 - HB_FINAL), shift = r < 8 ? 0 : sway * k * k;
+      for (let c = 0; c < COLS; c++) {
+        const i = r * COLS + c, s = CH[i];
+        if (!s || GL[i] !== pass) continue;
+        if (!pass) letters++; else letters++;
+        ctx.fillStyle = CO[i];
+        ctx.fillText(s, offX + (c + shift + 0.5) * cellW, offY + (r + 0.5) * ch);
+      }
+    }
+  }
+  ctx.shadowBlur = 0;
+  clockEl.textContent = `t ${T.toFixed(2)}s`;
+  infoEl.innerHTML = `rose · ascii · 2026<br>floraison <b>${(b * 100).toFixed(1)}%</b> &nbsp; oscillation <b>${(((T * 0.9 * 180 / Math.PI) % 360)).toFixed(2)}°</b><br>lettres <b>${letters.toLocaleString("fr-FR")}</b>`;
+}
+
+function tick(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (!paused) { T += dt; if (T > LOOP) T = 0; }
+  render();
+  requestAnimationFrame(tick);
+}
+const pauseBtn = document.getElementById("pause");
+const syncBtn = () => { pauseBtn.textContent = paused ? "Lecture" : "Pause"; };
+pauseBtn.onclick = () => { paused = !paused; syncBtn(); };
+document.getElementById("replay").onclick = () => { T = 0; paused = false; syncBtn(); };
+syncBtn(); resize();
+if (document.fonts && document.fonts.load) document.fonts.load('12px "JetBrains Mono"').then(resize);
+requestAnimationFrame(t => { last = t; tick(t); });
+</script>
+</body></html>
